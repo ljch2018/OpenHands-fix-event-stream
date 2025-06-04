@@ -53,6 +53,8 @@ class EventStream(EventStore):
     _thread_pools: dict[str, dict[str, ThreadPoolExecutor]]
     _thread_loops: dict[str, dict[str, asyncio.AbstractEventLoop]]
     _write_page_cache: list[dict]
+    _event_buffer: list[Event]  # Buffer events until first subscriber is registered
+    _has_subscribers: bool
 
     def __init__(self, sid: str, file_store: FileStore, user_id: str | None = None):
         super().__init__(sid, file_store, user_id)
@@ -68,6 +70,8 @@ class EventStream(EventStore):
         self._lock = threading.Lock()
         self.secrets = {}
         self._write_page_cache = []
+        self._event_buffer = []  # Initialize event buffer
+        self._has_subscribers = False  # Track if any subscribers exist
 
     def _init_thread_loop(self, subscriber_id: str, callback_id: str) -> None:
         loop = asyncio.new_event_loop()
@@ -147,6 +151,15 @@ class EventStream(EventStore):
 
         self._subscribers[subscriber_id][callback_id] = callback
         self._thread_pools[subscriber_id][callback_id] = pool
+        
+        # If this is the first subscriber, process buffered events
+        with self._lock:
+            if not self._has_subscribers:
+                self._has_subscribers = True
+                # Move all buffered events to the queue
+                for buffered_event in self._event_buffer:
+                    self._queue.put(buffered_event)
+                self._event_buffer.clear()
 
     def unsubscribe(
         self, subscriber_id: EventStreamSubscriber, callback_id: str
@@ -160,6 +173,13 @@ class EventStream(EventStore):
             return
 
         self._clean_up_subscriber(subscriber_id, callback_id)
+        
+        # Check if we have any subscribers left
+        with self._lock:
+            has_any_subscribers = any(
+                len(callbacks) > 0 for callbacks in self._subscribers.values()
+            )
+            self._has_subscribers = has_any_subscribers
 
     def add_event(self, event: Event, source: EventSource) -> None:
         if event.id != Event.INVALID_ID:
@@ -192,7 +212,13 @@ class EventStream(EventStore):
 
             # Store the cache page last - if it is not present during reads then it will simply be bypassed.
             self._store_cache_page(current_write_page)
-        self._queue.put(event)
+        
+        # Buffer events if no subscribers exist yet, otherwise add to queue
+        with self._lock:
+            if not self._has_subscribers:
+                self._event_buffer.append(event)
+            else:
+                self._queue.put(event)
 
     def _store_cache_page(self, current_write_page: list[dict]):
         """Store a page in the cache. Reading individual events is slow when there are a lot of them, so we use pages."""
